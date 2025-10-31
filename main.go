@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"sync"
-	"time"
 
 	"work"
 )
@@ -31,7 +30,7 @@ func (n *namePrinter) Task(goid int) {
 	log.Printf("goroutineID:%d", goid)
 
 	NetWorkStatus(n.name)
-	time.Sleep(time.Second)
+	//time.Sleep(time.Second)
 }
 
 func NetWorkStatus(web string) bool {
@@ -64,21 +63,31 @@ func NetWorkStatus(web string) bool {
 func main() {
 	p := work.New(4)
 	var wg sync.WaitGroup
-	wg.Add(10)
-
-	for i := 0; i < 10; i++ {
-		for _, name := range names {
-			//任务实例
-			np := namePrinter{
+	wg.Add(4)
+	nameCh := make(chan string,4)
+	for i := 0; i < 4; i++ {
+		
+		go func() {
+			for name := range nameCh { // 从 Channel 中消费任务
+				//任务实例
+				np := namePrinter{
 				name: name,
-			}
-
-			go func() {
+				}
 				p.Run(&np)
-				wg.Done()
-			}()
 		}
+			defer wg.Done()
+			
+		}()
+		
 	}
+
+	for _, task := range names {
+        nameCh <- task
+    }
+
+     close(nameCh)
 	wg.Wait()
+	
 	p.Shutdown()
+	
 }
