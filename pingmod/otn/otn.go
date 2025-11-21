@@ -5,178 +5,158 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"math"
 	"net"
+	"os"
+	"runtime"
 	"sync"
 	"time"
-	"work"
 )
 
-// tcp 报文前20个是报文头，后面的才是 ICMP 的内容。
-// ICMP：组建 ICMP 首部（8 字节） + 我们要传输的内容
-// ICMP 首部：type、code、校验和、ID、序号，1 1 2 2 2
-// 回显应答：type = 0，code = 0
-// 回显请求：type = 8, code = 0
-var (
-	helpFlag bool
-	timeout  int64 // 耗时
-	size     int   // 大小
-	count    int   // 请求次数
-	typ      uint8 = 8
-	code     uint8 = 0
-	SendCnt  int                   // 发送次数
-	RecCnt   int                   // 接收次数
-	MaxTime  int64 = math.MinInt64 // 最大耗时
-	MinTime  int64 = math.MaxInt64 // 最短耗时
-	SumTime  int64                 // 总计耗时
-)
-
-// ICMP 序号不能乱
+// ---------- ICMP 结构 ----------
 type ICMP struct {
-	Type        uint8  // 类型
-	Code        uint8  // 代码
-	CheckSum    uint16 // 校验和
-	ID          uint16 // ID
-	SequenceNum uint16 // 序号
+	Type        uint8
+	Code        uint8
+	CheckSum    uint16
+	ID          uint16
+	SequenceNum uint16
 }
 
-var names = []string{
-	"baidu",
+const (
+	timeout = 1000 // ms
+	size    = 32   // payload 大小
+	count   = 4    // 每个目标发送次数
+)
+
+var (
+	typ uint8  = 8  // Echo
+	code uint8 = 0
+	pid  uint16 = uint16(os.Getpid() & 0xffff)
+)
+
+// ---------- 目标 ----------
+var targets = []string{
+	"8.8.8.8",
+	"www.baidu.com",
 }
 
-type namePing struct {
-	name string
-}
+// ---------- 任务 ----------
+type PingTask struct{ target string }
 
-func (n *namePing) Task(goid int) {
-	Index_ping(n.name)
-}
+// ---------- 主逻辑 ----------
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime)
+defer timeCost(time.Now())
+	runtime.GOMAXPROCS(runtime.NumCPU()) // 让调度器可以用全部核心
+	pool := newWorkerPool(runtime.NumCPU())
 
-// @brief：耗时统计函数
+	for _, t := range targets {
+		pool.Submit(&PingTask{target: t})
+	}
+	pool.Wait()
+}
 func timeCost(start time.Time) {
 	tc := time.Since(start)
 	fmt.Printf("time cost = %v\n", tc)
 }
+// ---------- WorkerPool ----------
+type workerPool struct {
+	taskCh chan *PingTask
+	wg     sync.WaitGroup
+}
 
-func main() {
-	defer timeCost(time.Now())
-	p := work.New(1)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	for i := 0; i < 1; i++ {
-		for _, name := range names {
-			np := namePing{
-				name: name,
+func newWorkerPool(n int) *workerPool {
+	p := &workerPool{taskCh: make(chan *PingTask)}
+	p.wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		go func() {
+			// 每个 worker 绑定一条 OS 线程
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+
+			for task := range p.taskCh {
+				task.Run()
 			}
-			go func() {
-				p.Run(&np)
-				wg.Done()
-			}()
-		}
+			p.wg.Done()
+		}()
+	}
+	return p
+}
+
+func (p *workerPool) Submit(t *PingTask) { p.taskCh <- t }
+func (p *workerPool) Wait() {
+	close(p.taskCh)
+	p.wg.Wait()
+}
+
+// ---------- 任务执行 ----------
+func (t *PingTask) Run() {
+	var wg sync.WaitGroup
+	wg.Add(count)
+
+	for seq := 0; seq < count; seq++ {
+		go func(seq int) {
+			defer wg.Done()
+			sendOnePing(t.target, seq)
+		}(seq)
 	}
 	wg.Wait()
-	p.Shutdown()
 }
 
-var wg2 sync.WaitGroup
-
-func Start_ping(desIP string, conn net.Conn, i int) {
-
-	// 构建请求
-	icmp := &ICMP{
-		Type:        typ,
-		Code:        code,
-		CheckSum:    uint16(0),
-		ID:          uint16(i),
-		SequenceNum: uint16(i),
-	}
-	// 将请求转为二进制流
-	var buffer bytes.Buffer
-	binary.Write(&buffer, binary.BigEndian, icmp)
-	// 请求的数据
-	data := make([]byte, size)
-	// 将请求数据写到 icmp 报文头后
-	buffer.Write(data)
-	data = buffer.Bytes()
-	// ICMP 请求签名（校验和）：相邻两位拼接到一起，拼接成两个字节的数
-	checkSum := checkSum(data)
-	// 签名赋值到 data 里
-	data[2] = byte(checkSum >> 8)
-	data[3] = byte(checkSum)
-	startTime := time.Now()
-	// 设置超时时间
-	conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Millisecond))
-	// 将 data 写入连接中，
-	n, err := conn.Write(data)
+// ---------- 单次 Ping ----------
+func sendOnePing(target string, seq int) {
+	conn, err := net.DialTimeout("ip4:icmp", target, time.Duration(timeout)*time.Millisecond)
 	if err != nil {
-		log.Println(err)
-		return
-		//continue
-	}
-
-	// 接收响应
-	buf := make([]byte, 1024)
-	n, err = conn.Read(buf)
-
-	if err != nil {
-		log.Println(buf)
-		return
-		//continue
-	}
-	// 打印信息
-	t := time.Since(startTime).Milliseconds()
-	log.Printf("(%d) %s 来自 %d.%d.%d.%d 的回复：字节=%d 时间=%d TTL=%d\n", i, desIP, buf[12], buf[13], buf[14], buf[15], n-28, t, buf[8])
-	wg2.Done()
-}
-
-func Index_ping(pname string) {
-	timeout = 1000
-	size = 32
-	count = 10
-
-	// 获取目标 IP
-	desIP := pname
-	//fmt.Println(desIP)
-	// 构建连接
-	conn, err := net.DialTimeout("ip:icmp", desIP, time.Duration(timeout)*time.Millisecond)
-	if err != nil {
-		log.Println(err.Error())
 		return
 	}
 	defer conn.Close()
 
-	for i := 0; i < count; i++ {
-		wg2.Add(1)
-		go Start_ping(desIP, conn, i)
-
+	// 构造 ICMP
+	icmp := ICMP{
+		Type:        typ,
+		Code:        code,
+		CheckSum:    0,
+		ID:          pid,
+		SequenceNum: uint16(seq),
 	}
 
-	wg2.Wait()
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, icmp)
+	buf.Write(make([]byte, size))
+	pkt := buf.Bytes()
+	binary.BigEndian.PutUint16(pkt[2:4], checkSum(pkt))
 
+	start := time.Now()
+	conn.SetWriteDeadline(time.Now().Add(timeout * time.Millisecond))
+	conn.SetReadDeadline(time.Now().Add(timeout * time.Millisecond))
+
+	if _, err = conn.Write(pkt); err != nil {
+		return
+	}
+
+	reply := make([]byte, 1500)
+	n, err := conn.Read(reply)
+	if err != nil || n < 28 || reply[20] != 0 {
+		return
+	}
+
+	rtt := time.Since(start).Milliseconds()
+	srcIP := net.IPv4(reply[12], reply[13], reply[14], reply[15])
+	log.Printf("(%d) %s 来自 %s 的回复：字节=%d 时间=%d TTL=%d",
+		seq, target, srcIP, size, rtt, reply[8])
 }
 
-// 求校验和
+// ---------- 校验和 ----------
 func checkSum(data []byte) uint16 {
-	// 第一步：两两拼接并求和
-	length := len(data)
-	index := 0
 	var sum uint32
-	for length > 1 {
-		// 拼接且求和
-		sum += uint32(data[index])<<8 + uint32(data[index+1])
-		length -= 2
-		index += 2
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
 	}
-	// 奇数情况，还剩下一个，直接求和过去
-	if length == 1 {
-		sum += uint32(data[index])
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
 	}
-	// 第二部：高 16 位，低 16 位 相加，直至高 16 位为 0
-	hi := sum >> 16
-	for hi != 0 {
-		sum = hi + uint32(uint16(sum))
-		hi = sum >> 16
+	for sum>>16 != 0 {
+		sum = (sum >> 16) + (sum & 0xffff)
 	}
-	// 返回 sum 值 取反
-	return uint16(^sum)
+	return ^uint16(sum)
 }
